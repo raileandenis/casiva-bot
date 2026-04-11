@@ -50,7 +50,8 @@ async function logToSupabase(invoice, project) {
       amount: Math.round(materialsTotal * 100) / 100,
       date: today,
       receipt_ref: receiptRef,
-      notes: itemDetails
+      notes: itemDetails,
+      source: 'telegram'
     });
   }
 
@@ -69,7 +70,8 @@ async function logToSupabase(invoice, project) {
       amount: Math.round(servicesTotal * 100) / 100,
       date: today,
       receipt_ref: receiptRef,
-      notes: itemDetails
+      notes: itemDetails,
+      source: 'telegram'
     });
   }
 
