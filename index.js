@@ -5,6 +5,23 @@ const { logDekadaToProject, createInboxEntry, getActiveProjects, findProject } =
 
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 
+// ── Access control ─────────────────────────────────────────────────────────
+
+const ALLOWED_USERS = [385362364, 831666466]
+
+function isAllowed(ctx) {
+  return ALLOWED_USERS.includes(ctx.from?.id)
+}
+
+bot.use((ctx, next) => {
+  if (!isAllowed(ctx)) {
+    const { id, username, first_name } = ctx.from ?? {}
+    console.log(`[${new Date().toISOString()}] Unauthorized access attempt — id: ${id}, username: @${username ?? 'unknown'}, name: ${first_name ?? 'unknown'}`)
+    return ctx.reply('⛔ Access denied. This bot is private.')
+  }
+  return next()
+})
+
 // Command menu shown when user types /
 bot.telegram.setMyCommands([
   { command: 'start', description: 'Start the bot' },
@@ -17,7 +34,8 @@ bot.use(session({
   defaultSession: () => ({
     pendingInvoice: null,
     waitingFor: null,
-    selectedProject: null
+    selectedProject: null,
+    isDebt: false
   })
 }));
 
@@ -138,7 +156,7 @@ bot.action(/project_(.+)/, async (ctx) => {
     if (!project) return ctx.answerCbQuery('Project not found');
 
     ctx.session.selectedProject = project;
-    ctx.session.waitingFor = 'confirm_dekada';
+    ctx.session.waitingFor = 'debt_choice';
 
     const inv = ctx.session.pendingInvoice;
     let msg = `📋 Project: ${project.project_code} — ${project.title}\n`;
@@ -152,9 +170,10 @@ bot.action(/project_(.+)/, async (ctx) => {
     if (svcTotal > 0) msg += `🔧 Services: ${svcTotal.toFixed(2)} MDL\n`;
     msg += `💰 Total: ${inv.total} MDL\n\n`;
 
-    await ctx.editMessageText(msg + 'Confirm logging to CRM?',
+    await ctx.editMessageText(msg + 'Is this invoice already paid or will you pay later?',
       Markup.inlineKeyboard([
-        [Markup.button.callback('✅ Yes, log it', 'confirm_yes')],
+        [Markup.button.callback('✅ Already Paid', 'debt_no')],
+        [Markup.button.callback('⏳ Pay Later — record as debt', 'debt_yes')],
         [Markup.button.callback('❌ Cancel', 'confirm_no')]
       ])
     );
@@ -165,22 +184,62 @@ bot.action(/project_(.+)/, async (ctx) => {
   }
 });
 
+// Debt choice handlers
+bot.action('debt_no', async (ctx) => {
+  ctx.session.isDebt = false;
+  ctx.session.waitingFor = 'confirm_dekada';
+  const inv = ctx.session.pendingInvoice;
+  const project = ctx.session.selectedProject;
+  const matTotal = inv.materials?.reduce((s, m) => s + m.amount, 0) || 0;
+  const svcTotal = inv.services?.reduce((s, s2) => s + s2.amount, 0) || 0;
+  let msg = `📋 ${project.project_code} — ${project.title}\n`;
+  if (matTotal > 0) msg += `📦 Materials: ${matTotal.toFixed(2)} MDL\n`;
+  if (svcTotal > 0) msg += `🔧 Services: ${svcTotal.toFixed(2)} MDL\n`;
+  msg += `💰 Total: ${inv.total} MDL\n✅ Payment: Already paid (no debt)\n\nConfirm logging to CRM?`;
+  await ctx.editMessageText(msg, Markup.inlineKeyboard([
+    [Markup.button.callback('✅ Yes, log it', 'confirm_yes')],
+    [Markup.button.callback('❌ Cancel', 'confirm_no')]
+  ]));
+  ctx.answerCbQuery();
+});
+
+bot.action('debt_yes', async (ctx) => {
+  ctx.session.isDebt = true;
+  ctx.session.waitingFor = 'confirm_dekada';
+  const inv = ctx.session.pendingInvoice;
+  const project = ctx.session.selectedProject;
+  const matTotal = inv.materials?.reduce((s, m) => s + m.amount, 0) || 0;
+  const svcTotal = inv.services?.reduce((s, s2) => s + s2.amount, 0) || 0;
+  let msg = `📋 ${project.project_code} — ${project.title}\n`;
+  if (matTotal > 0) msg += `📦 Materials: ${matTotal.toFixed(2)} MDL\n`;
+  if (svcTotal > 0) msg += `🔧 Services: ${svcTotal.toFixed(2)} MDL\n`;
+  msg += `💰 Total: ${inv.total} MDL\n⏳ Payment: Will pay later (recorded as debt)\n\nConfirm logging to CRM?`;
+  await ctx.editMessageText(msg, Markup.inlineKeyboard([
+    [Markup.button.callback('✅ Yes, log it', 'confirm_yes')],
+    [Markup.button.callback('❌ Cancel', 'confirm_no')]
+  ]));
+  ctx.answerCbQuery();
+});
+
 // Confirm Dekada logging
 bot.action('confirm_yes', async (ctx) => {
   try {
     const inv = ctx.session.pendingInvoice;
     const project = ctx.session.selectedProject;
-    const result = await logDekadaToProject(inv, project);
+    const isDebt = ctx.session.isDebt ?? false;
+    const result = await logDekadaToProject(inv, project, isDebt);
 
+    const debtNote = isDebt ? '\n⏳ Recorded as supplier debt' : '\n✅ No debt recorded';
     await ctx.editMessageText(
       `✅ Logged to ${project.project_code}!\n` +
-      `${result.count} entries, total ${result.total} MDL\n\n` +
-      `View: https://casiva-app.vercel.app/projects/${project.id}`
+      `${result.count} entries, total ${result.total} MDL` +
+      debtNote + `\n\nView: https://casiva-app.vercel.app/projects/${project.id}`
     );
 
     ctx.session.pendingInvoice = null;
     ctx.session.waitingFor = null;
     ctx.session.selectedProject = null;
+    ctx.session.isDebt = false;
     ctx.answerCbQuery('Done!');
   } catch (err) {
     console.error(err);

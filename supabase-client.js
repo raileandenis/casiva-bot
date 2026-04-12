@@ -45,7 +45,7 @@ async function getPendingInboxCount() {
   return count || 0;
 }
 
-async function logDekadaToProject(invoice, project) {
+async function logDekadaToProject(invoice, project, isDebt = false) {
   const dekadaId = await getDekadaId();
   const today = invoice.date || new Date().toISOString().split('T')[0];
   const receiptRef = invoice.invoice_number;
@@ -90,7 +90,24 @@ async function logDekadaToProject(invoice, project) {
 
   const { error } = await supabase.from('cost_entries').insert(entries);
   if (error) throw error;
+
   const total = entries.reduce((s, e) => s + e.amount, 0);
+
+  // If isDebt, also create a supplier_invoice record
+  if (isDebt && dekadaId) {
+    const { error: invError } = await supabase.from('supplier_invoices').insert({
+      supplier_id: dekadaId,
+      invoice_number: receiptRef,
+      amount: Math.round(total * 100) / 100,
+      date: today,
+      description: `Dekada Order #${receiptRef}`,
+      project_id: project.id,
+      status: 'unpaid',
+      source: 'telegram'
+    });
+    if (invError) console.error('Failed to create supplier invoice:', invError);
+  }
+
   return { count: entries.length, total: Math.round(total * 100) / 100 };
 }
 
