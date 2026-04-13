@@ -45,10 +45,105 @@ async function getPendingInboxCount() {
   return count || 0;
 }
 
+// Redistribute all payments across invoices oldest-first and update supplier debt.
+// Mirrors the same logic as recalculateSupplierDebt in useSuppliers.ts.
+async function recalculateSupplierDebt(supplierId) {
+  const { data: invoices } = await supabase
+    .from('supplier_invoices')
+    .select('id, amount')
+    .eq('supplier_id', supplierId)
+    .order('date', { ascending: true });
+
+  const { data: payments } = await supabase
+    .from('supplier_payments')
+    .select('id, amount')
+    .eq('supplier_id', supplierId)
+    .order('date', { ascending: true });
+
+  const totalPayments = (payments || []).reduce((s, p) => s + (p.amount || 0), 0);
+
+  if (!invoices || invoices.length === 0) {
+    await supabase
+      .from('suppliers')
+      .update({ credit_balance: totalPayments, current_debt: 0 })
+      .eq('id', supplierId);
+    return;
+  }
+
+  // Reset all invoices to unpaid
+  await supabase
+    .from('supplier_invoices')
+    .update({ amount_paid: 0, status: 'unpaid' })
+    .eq('supplier_id', supplierId);
+
+  // Distribute payment pool oldest-first
+  let paymentPool = totalPayments;
+  const updates = [];
+  for (const inv of invoices) {
+    if (paymentPool <= 0) {
+      updates.push({ id: inv.id, amount_paid: 0, status: 'unpaid' });
+    } else if (paymentPool >= inv.amount) {
+      updates.push({ id: inv.id, amount_paid: inv.amount, status: 'paid' });
+      paymentPool -= inv.amount;
+    } else {
+      updates.push({ id: inv.id, amount_paid: paymentPool, status: 'partial' });
+      paymentPool = 0;
+    }
+  }
+
+  await Promise.all(
+    updates.map((u) =>
+      supabase
+        .from('supplier_invoices')
+        .update({ amount_paid: u.amount_paid, status: u.status })
+        .eq('id', u.id)
+    )
+  );
+
+  const creditBalance = paymentPool;
+  await supabase
+    .from('suppliers')
+    .update({ credit_balance: creditBalance, current_debt: 0 })
+    .eq('id', supplierId);
+}
+
+// Option B: create supplier_invoice FIRST, then cost_entries linked to it.
+// This prevents double-counting: cost_entries = actual spend, invoice = debt record.
 async function logDekadaToProject(invoice, project, isDebt = false) {
   const dekadaId = await getDekadaId();
   const today = invoice.date || new Date().toISOString().split('T')[0];
   const receiptRef = invoice.invoice_number;
+  const totalAmount = invoice.total ||
+    (invoice.materials?.reduce((s, m) => s + m.amount, 0) || 0) +
+    (invoice.services?.reduce((s, sv) => s + sv.amount, 0) || 0);
+
+  let supplierInvoiceId = null;
+
+  // STEP 1: Create supplier invoice FIRST if recording as debt
+  if (isDebt && dekadaId) {
+    const { data: inv, error: invError } = await supabase
+      .from('supplier_invoices')
+      .insert({
+        supplier_id: dekadaId,
+        invoice_number: receiptRef,
+        amount: Math.round(totalAmount * 100) / 100,
+        date: today,
+        description: `Dekada Order #${receiptRef}`,
+        project_id: project.id,
+        status: 'unpaid',
+        source: 'telegram'
+      })
+      .select()
+      .single();
+
+    if (invError) throw invError;
+    supplierInvoiceId = inv.id;
+
+    // Recalculate debt after creating the invoice
+    await recalculateSupplierDebt(dekadaId);
+  }
+
+  // STEP 2: Create cost entries linked to supplier invoice
   const entries = [];
 
   if (invoice.materials?.length > 0) {
@@ -57,9 +152,11 @@ async function logDekadaToProject(invoice, project, isDebt = false) {
     const details = invoice.materials.map(m =>
       `${m.description}: ${m.quantity} ${m.unit} × ${m.unit_price} = ${m.amount} MDL`
     ).join('\n');
+
     entries.push({
       project_id: project.id,
       supplier_id: dekadaId,
+      supplier_invoice_id: supplierInvoiceId,
       category: 'material',
       description: `Dekada - ${types || 'Materials'} (Order #${receiptRef})`,
       amount: Math.round(matTotal * 100) / 100,
@@ -75,9 +172,11 @@ async function logDekadaToProject(invoice, project, isDebt = false) {
     const details = invoice.services.map(s =>
       `${s.description}: ${s.quantity} ${s.unit} × ${s.unit_price} = ${s.amount} MDL`
     ).join('\n');
+
     entries.push({
       project_id: project.id,
       supplier_id: dekadaId,
+      supplier_invoice_id: supplierInvoiceId,
       category: 'service',
       description: `Dekada - Services (Order #${receiptRef})`,
       amount: Math.round(svcTotal * 100) / 100,
@@ -92,22 +191,6 @@ async function logDekadaToProject(invoice, project, isDebt = false) {
   if (error) throw error;
 
   const total = entries.reduce((s, e) => s + e.amount, 0);
-
-  // If isDebt, also create a supplier_invoice record
-  if (isDebt && dekadaId) {
-    const { error: invError } = await supabase.from('supplier_invoices').insert({
-      supplier_id: dekadaId,
-      invoice_number: receiptRef,
-      amount: Math.round(total * 100) / 100,
-      date: today,
-      description: `Dekada Order #${receiptRef}`,
-      project_id: project.id,
-      status: 'unpaid',
-      source: 'telegram'
-    });
-    if (invError) console.error('Failed to create supplier invoice:', invError);
-  }
-
   return { count: entries.length, total: Math.round(total * 100) / 100 };
 }
 
@@ -196,5 +279,6 @@ module.exports = {
   getDekadaId,
   getPendingInboxCount,
   logDekadaToProject,
-  createInboxEntry
+  createInboxEntry,
+  recalculateSupplierDebt
 };
